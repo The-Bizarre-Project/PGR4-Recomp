@@ -8,7 +8,7 @@ This project intends to port Project Gotham Racing 4 to PC / any x86_64 hardware
 ## v2 is in the works! Release will hopefully be on **November 20th**
 
 ## Current **known** issues
-* Volume of music in races can't be adjusted, Fix implemented in v2.
+* Volume of music in races can't be adjusted, Fix implemented in v1.2.2.
 * Music toast doesn't align to the current song playing in a race, solution will be implemented in v2.
 * Geometry Wars in the garage causes a crash, will be using [Re:Blue's](https://github.com/zolaware/reblue) multi-xex bootstrapper to get it working.
 * Lotus Espirit Essex Turbo doesn't seem to load and freezes the game, solution will be implemented in v2, alongside native rendering.
