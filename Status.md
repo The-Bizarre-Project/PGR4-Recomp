@@ -4,7 +4,9 @@
 - [X] AI Works
 - [X] Fully stable
 - [X] Graphics Work
-- [ ] All cars work (Lotus Espirit Essex Turbo doesn't load, this will be checked once the Native Renderer is implemented.)
+- [x] All cars work, including DLC
+- [x] Title Updates & DLC Work
+- [x] Radio fully works
 
 ## Current update progress
 - [x] v1 - Initial release
