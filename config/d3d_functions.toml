@@ -1,0 +1,64 @@
+# PGR4 guest D3D9 (Xbox 360 XDK) entry points the native renderer hooks.
+#
+# Each address was located in PGR4's own recompiled code and confirmed in IDA
+# against default.xex (decompiled body, arguments and device offsets).
+# The notes record the evidence.
+
+[functions]
+# Device lifecycle
+0x826CD270 = { name = "Direct3D_CreateDevice" }      # allocs 0x5780-byte device (128-aligned), *ppDevice=0 first
+0x826CB148 = { name = "D3DDevice_Swap" }             # only caller of VdSwap
+0x826CD008 = { name = "D3DDevice_Reset" }            # ring re-init (sub_826CEC18) + sub_826DA818 surfaces
+0x826DA818 = { name = "D3D__CreatePresentationSurfaces" } # front buffer texture + depth surface from present params
+0x826D1A08 = { name = "D3DDevice_Clear" }            # flags/color/z(f1)/stencil
+0x826D1C38 = { name = "D3DDevice_BeginTiling" }      # tile count at device+0x31C4, rects follow
+0x826D20D0 = { name = "D3DDevice_EndTiling" }
+0x826D1AC8 = { name = "D3DDevice_SetPredication" }
+0x826CBEE0 = { name = "D3DDevice_Resolve" }
+0x826D2F00 = { name = "D3DQuery_Issue" }             # flags & 2 = D3DISSUE_BEGIN
+0x826D3188 = { name = "D3DQuery_GetData" }           # switches on query type (9/10)
+0x826CE8C0 = { name = "D3DDevice_KickOffAndGetSpace" }
+0x826CEBC0 = { name = "D3DDevice_InsertCallback" }
+
+# Draws
+0x826CFF58 = { name = "D3DDevice_DrawVertices" }         # flushes the 5 dirty-mask u64s first
+0x826D0340 = { name = "D3DDevice_DrawIndexedVertices" }
+0x826CFF10 = { name = "D3DDevice_DrawVerticesUP" }       # BeginVertices + memcpy of user data
+0x826CFA60 = { name = "D3DDevice_BeginVertices" }        # (dev, prim, count, stride) -> data ptr in ring
+0x826CFF00 = { name = "D3DDevice_EndVertices" }          # ring ptr (+0x30) <- saved (+0x3474)
+
+# Resources
+0x826C89F8 = { name = "D3DDevice_CreateTexture" }
+0x826C8B18 = { name = "D3DDevice_CreateSurface" }
+0x826CF740 = { name = "D3DDevice_CreateVertexBuffer" }   # 32-byte D3DVertexBuffer
+0x826CF868 = { name = "D3DDevice_CreateIndexBuffer" }
+0x826CF808 = { name = "D3DVertexBuffer_Lock" }
+0x826CF858 = { name = "D3DVertexBuffer_Unlock" }         # flush [+0x18 & ~3]
+0x826CF918 = { name = "D3DIndexBuffer_Lock" }
+0x826CF960 = { name = "D3DIndexBuffer_Unlock" }          # flush [+0x18]
+0x826CF970 = { name = "D3DResource_GetType" }            # Common & 0xF switch
+0x826CF5F8 = { name = "D3DResource_AddRef" }
+0x826CF670 = { name = "D3DResource_Release" }
+0x826CF0C8 = { name = "D3DResource_Destroy" }
+0x826C6B90 = { name = "D3DResource_Unlock" }             # flush base (+0x20) and mip (+0x30) ranges
+0x826C6BA8 = { name = "D3DSurface_UnlockRect" }          # parent texture at +0x18
+0x826C8CD8 = { name = "D3DSurface_LockRect" }
+
+# Shaders and vertex declarations
+0x826CA860 = { name = "D3DDevice_CreateVertexShader" }
+0x826CA710 = { name = "D3DDevice_CreatePixelShader" }
+0x826CA820 = { name = "XGSetVertexShaderHeader" }    # (shader, size, info): zero 872 bytes, copy *info container header to +0x368; used by the effect loader (sub_822B34A0)
+0x826CA6D8 = { name = "XGSetPixelShaderHeader" }     # (shader, size, info): zero 40 bytes, copy *info container header to +0x28 (sub_822B35F0)
+0x826CA3A0 = { name = "D3DDevice_CreateVertexDeclaration" }  # walks elements to stream 0xFF
+
+# State
+0x826C6378 = { name = "D3DDevice_SetViewport" }          # D3DVIEWPORT9: 4 ints + MinZ/MaxZ
+0x826C59D8 = { name = "D3DDevice_SetScissorRect" }       # RECT stored at device+0x317C
+0x826C64B0 = { name = "D3DDevice_SetRenderTarget" }      # RT shadow at device+0x3090+4*idx
+0x826C6818 = { name = "D3DDevice_SetDepthStencilSurface" } # DS shadow at device+0x30A0
+0x826CA130 = { name = "D3DDevice_SetVertexShader" }
+0x826C9E30 = { name = "D3DDevice_SetPixelShader" }
+0x826CA348 = { name = "D3DDevice_SetVertexDeclaration" }
+0x826C8D60 = { name = "D3DDevice_SetTexture" }           # shadow device+4*(3134+stage), fetch const 0x480+24*stage
+0x826C5B28 = { name = "D3DDevice_SetStreamSource" }
+0x826C5CD0 = { name = "D3DDevice_SetIndices" }

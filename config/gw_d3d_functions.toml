@@ -1,0 +1,52 @@
+# Geometry Wars: Waves guest D3D entry points, title update 0.0.2.1
+# (TitleUpdate/gw.xex + gw.xexp, title 4D5307F9).
+#
+# gw.xex is built with the same XDK D3D as PGR4: each address below was
+# matched to PGR4's function of the same name (config/d3d_functions.toml) by
+# instruction sequence in IDA (base gw.xex), identical apart from data
+# addresses, then carried to the title update by matching the generated code
+# (only SetPredication moved, from 0x820717C8). The
+# codegen prefixes them like every GW symbol (gw_D3DDevice_Swap, ...).
+# PGR4 functions with no counterpart here (tiling, Z pass, queries, the
+# XGSet*ShaderHeader effect path, DrawIndexedVertices, DrawVerticesUP) are
+# not linked into gw.xex.
+
+[functions]
+# Device lifecycle
+0x82064C68 = { name = "Direct3D_CreateDevice" }
+0x820654F0 = { name = "D3DDevice_Swap" }
+0x82070ED0 = { name = "D3D__CreatePresentationSurfaces" }
+0x82066E28 = { name = "D3DDevice_Clear" }
+0x820717D0 = { name = "D3DDevice_SetPredication" }
+0x8206A4D8 = { name = "D3DDevice_Resolve" }
+0x82068200 = { name = "D3DDevice_KickOffAndGetSpace" }
+
+# Draws
+0x82061B08 = { name = "D3DDevice_DrawVertices" }
+0x82061658 = { name = "D3DDevice_BeginVertices" }
+0x82061AF8 = { name = "D3DDevice_EndVertices" }      # not a function in IDA; 4 callers bl to it
+
+# Resources
+0x82064390 = { name = "D3DDevice_CreateTexture" }
+0x820644B0 = { name = "D3DDevice_CreateSurface" }
+0x82062658 = { name = "D3DDevice_CreateIndexBuffer" }
+0x820625F8 = { name = "D3DVertexBuffer_Lock" }
+0x820624B0 = { name = "D3DResource_AddRef" }
+0x82062528 = { name = "D3DResource_Release" }
+0x82061F80 = { name = "D3DResource_Destroy" }
+
+# Shaders and vertex declarations
+0x82069CD0 = { name = "D3DDevice_CreateVertexShader" }
+0x82069BC0 = { name = "D3DDevice_CreatePixelShader" }
+0x82069960 = { name = "D3DDevice_CreateVertexDeclaration" }
+
+# State
+0x82060ED8 = { name = "D3DDevice_SetViewport" }
+0x82060688 = { name = "D3DDevice_SetScissorRect" }
+0x82061010 = { name = "D3DDevice_SetRenderTarget" }
+0x82061378 = { name = "D3DDevice_SetDepthStencilSurface" }
+0x82069778 = { name = "D3DDevice_SetVertexShader" }
+0x820694C0 = { name = "D3DDevice_SetPixelShader" }
+0x820646F8 = { name = "D3DDevice_SetTexture" }
+0x82060788 = { name = "D3DDevice_SetStreamSource" }
+0x820608A8 = { name = "D3DDevice_SetIndices" }

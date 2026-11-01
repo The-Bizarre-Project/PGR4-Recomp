@@ -1,0 +1,5 @@
+// PGR4 launcher resources: icon and background art (from the PGR4Recomp launcher).
+1 ICON "assets/PGR4.ico"
+101 RCDATA "assets/car1.jpg"
+102 RCDATA "assets/car2.jpg"
+103 RCDATA "assets/car3.jpg"
