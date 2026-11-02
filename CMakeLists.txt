@@ -28,6 +28,7 @@ set(PGR4RECOMPILED_SOURCES
     src/stream_flush_guard.cpp
     src/audio_lock_trace.cpp
     src/occlusion_query.cpp
+    src/walk_camera_pace.cpp
     src/content/dlc.cpp
     src/profiler.cpp
 )
@@ -84,7 +85,8 @@ if(PGR4_D3D12_RENDERER)
         REQUIRED)
     set(PGR4_HOST_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/host_shaders")
     set(PGR4_HOST_SHADER_HEADERS)
-    foreach(shader IN ITEMS imgui_vs:vs_5_1 imgui_ps:ps_5_1 present_vs:vs_5_1 present_ps:ps_5_1)
+    foreach(shader IN ITEMS imgui_vs:vs_5_1 imgui_ps:ps_5_1 present_vs:vs_5_1 present_ps:ps_5_1
+                        solid_ps:ps_5_1)
         string(REPLACE ":" ";" parts "${shader}")
         list(GET parts 0 stem)
         list(GET parts 1 profile)

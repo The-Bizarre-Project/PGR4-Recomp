@@ -695,10 +695,13 @@ bool Video::CreateHostDevice(void *hwnd) {
                                   kNumFrames + 1, false, kNumFrames);
   s.swap_chain = s.queue->createSwapChain(desc);
   if (!s.swap_chain || s.swap_chain->isEmpty()) {
-    REXGPU_ERROR("PGR4 D3D12: createSwapChain failed");
-    return false;
+    // Rendering (and frame dumps) still run; frames are submitted unpresented.
+    REXGPU_ERROR("PGR4 D3D12: createSwapChain failed; rendering without presenting");
+    // Left alive: Plume's destructor faults on a swap chain that failed to
+    // initialise.
+    (void)s.swap_chain.release();
   }
-  if (!BuildSwapChainTargets(s) || !BuildBindlessSets(s)) {
+  if ((s.swap_chain && !BuildSwapChainTargets(s)) || !BuildBindlessSets(s)) {
     return false;
   }
   if (!BuildPresentPipeline(s)) {
@@ -736,8 +739,8 @@ bool Video::CreateHostDevice(void *hwnd) {
                 int(options.ResourceBindingTier));
   }
   REXGPU_INFO("PGR4 D3D12: device '{}', swapchain {}x{} ({} images)",
-              s.device->getDescription().name, s.swap_chain->getWidth(),
-              s.swap_chain->getHeight(), s.swap_chain->getTextureCount());
+              s.device->getDescription().name, s.swap_chain ? s.swap_chain->getWidth() : 0,
+              s.swap_chain ? s.swap_chain->getHeight() : 0, s.swap_chain ? s.swap_chain->getTextureCount() : 0);
   s.ready = true;
   return true;
 }
@@ -1023,6 +1026,11 @@ void Video::Present(const PresentSource &source) {
   plume::RenderCommandList *list = OpenListLocked(s);
   auto &slot = s.slots[s.frame];
 
+  if (!s.swap_chain) {
+    SubmitWithoutPresent(s);
+    s.frames_presented.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   if (s.swap_chain->needsResize() ||
       s.resize_requested.exchange(false, std::memory_order_acq_rel)) {
     SubmitWithoutPresent(s);

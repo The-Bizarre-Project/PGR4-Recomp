@@ -43,6 +43,7 @@
 #include "gpu/shader_cache.h"
 #include "gpu/texture_convert.h"
 #include "gpu/video.h"
+#include "solid_ps.dxbc.h"
 
 REXCVAR_DEFINE_BOOL(renderer_profile, false, "PGR4",
                     "Log per-stage renderer timings every 600 frames (costs some CPU per draw)");
@@ -56,6 +57,11 @@ REXCVAR_DEFINE_INT32(gpu_safe, 0, "PGR4",
                      "4 skip indexed vertex fetch draws, 8 skip vertex-index draws, 16 no mip levels, "
                      "32 no cube/volume textures, 64 indexed fetch reads a null stream, "
                      "128 indexed fetch reads nothing, 256 viewport from SetViewport's struct");
+REXCVAR_DEFINE_BOOL(debug_solid_ps, false, "PGR4",
+                    "Debug: draw every guest draw with a solid magenta pixel shader");
+REXCVAR_DEFINE_BOOL(debug_no_blend, false, "PGR4", "Debug: draw every guest draw with blending off");
+REXCVAR_DEFINE_BOOL(quad_index_buffer, true, "PGR4",
+                    "Non-indexed quad lists draw from one fixed index buffer (false: indices uploaded per draw)");
 REXCVAR_DEFINE_BOOL(poison_targets, false, "PGR4",
                     "Debug: fill new render targets with NaN instead of zero");
 REXCVAR_DEFINE_DOUBLE(aspect_ratio, 0.0, "PGR4",
@@ -88,6 +94,10 @@ REXCVAR_DEFINE_INT32(texture_workers, -1, "PGR4",
                      "Threads that untile and convert textures while the frame records (-1: auto, 0: inline)");
 REXCVAR_DEFINE_BOOL(profile_render_thread, false, "PGR4",
                     "Debug: sample the render thread's call stacks 1000 times a second into render_samples.txt");
+namespace pgr4 {
+bool WalkCameraActive(); // walk_camera_pace.cpp
+} // namespace pgr4
+
 REXCVAR_DEFINE_INT32(frame_rate_limit, 60, "PGR4",
                      "Frames per second the game may run at (0: unlimited; the 360 runs PGR4 at 30)");
 REXCVAR_DEFINE_INT32(internal_resolution, 720, "PGR4",
@@ -330,7 +340,13 @@ struct SharedConstants {
   // plates under every HUD text): the vertex shader moves each vertex in the
   // top third up by this and each in the bottom third down.
   float ui_edge_shift_y;
-  float pad30;
+  // c30.w: per VS input (2 bits, declaration order), how many components its
+  // vertex format lacks (0 = four). The shader's decode fills them as the
+  // Xenos does (0, 0, 1) instead of trusting the input assembler: AMD's
+  // Vulkan drivers under vkd3d-proton fill a float format's missing w of a
+  // uint4 input with integer 1, not 1.0f, so float2/float3 positions read as
+  // .xyzw got w = 0 (Geometry Wars, PGR4's medals, speedometer, minimap).
+  uint32_t input_missing;
 };
 static_assert(sizeof(SharedConstants) == 31 * 16);
 
@@ -380,6 +396,7 @@ struct VertexDeclaration {
 struct InputBinding {
   std::vector<plume::RenderInputElement> elements;
   uint32_t input_modes = 0;
+  uint32_t input_missing = 0; // SharedConstants::input_missing
   uint32_t stream_mask = 0;
   bool r11g11b10 = false;
 };
@@ -558,6 +575,11 @@ struct RendererState {
   std::unique_ptr<plume::RenderSampler> default_sampler;
   std::vector<plume::RenderSampler *> sampler_list; // by SamplerFor index
   std::unique_ptr<plume::RenderBuffer> null_stream;
+  std::unique_ptr<plume::RenderShader> solid_ps; // --debug_solid_ps
+  // Quad list pattern (0 1 2 0 2 3, +4 a quad) for non-indexed quad lists,
+  // drawn with the first vertex as base vertex (--quad_index_buffer).
+  std::unique_ptr<plume::RenderBuffer> quad_indices;
+  uint32_t quad_index_quads = 0;
 
   uint32_t next_id = 1;
   uint64_t frame = 1;
@@ -877,6 +899,25 @@ const VertexDeclaration *DeclarationFor(RendererState &s, uint32_t decl) {
 
 // Xbox 360 D3DDECLTYPE: bits 0-5 are the GPU vertex format, bit 8 signed,
 // bit 9 integer (not normalized). Returns the IA format and the shader-side
+// Components a vertex element format supplies.
+uint32_t FormatComponents(plume::RenderFormat format) {
+  using F = plume::RenderFormat;
+  switch (format) {
+  case F::R32_FLOAT: case F::R32_UINT: case F::R32_SINT:
+  case F::R16_FLOAT: case F::R16_UNORM: case F::R16_SNORM: case F::R16_UINT: case F::R16_SINT:
+  case F::R8_UNORM: case F::R8_SNORM: case F::R8_UINT: case F::R8_SINT:
+    return 1;
+  case F::R32G32_FLOAT: case F::R32G32_UINT: case F::R32G32_SINT:
+  case F::R16G16_FLOAT: case F::R16G16_UNORM: case F::R16G16_SNORM: case F::R16G16_UINT: case F::R16G16_SINT:
+  case F::R8G8_UNORM: case F::R8G8_SNORM: case F::R8G8_UINT: case F::R8G8_SINT:
+    return 2;
+  case F::R32G32B32_FLOAT: case F::R32G32B32_UINT: case F::R32G32B32_SINT:
+    return 3;
+  default:
+    return 4;
+  }
+}
+
 // decode mode (shader_common_sm51.h: 0 float bits, 1 signed, 2 unsigned).
 plume::RenderFormat DeclTypeFormat(uint32_t type, uint32_t &mode, bool &packed_normal) {
   using F = plume::RenderFormat;
@@ -973,6 +1014,11 @@ const InputBinding *InputBindingFor(RendererState &s, const HostShader *vs,
     }
     b.elements.emplace_back(name, in.usage_index, i, format, match->stream, match->offset);
     b.input_modes |= mode << (i * 2);
+    // DEC3N (mode 3) and packed normals unpack four components from one.
+    const uint32_t components = mode == 3 || packed ? 4u : FormatComponents(format);
+    if (i < 16) {
+      b.input_missing |= (4u - components) << (i * 2);
+    }
     b.stream_mask |= 1u << match->stream;
     b.r11g11b10 |= packed;
   }
@@ -2469,6 +2515,13 @@ plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, con
   pd.pipelineLayout = s.layout.get();
   pd.vertexShader = vs->shader.get();
   pd.pixelShader = ps ? ps->shader.get() : nullptr;
+  if (REXCVAR_GET(debug_solid_ps)) {
+    if (!s.solid_ps) {
+      s.solid_ps = s.device->createShader(g_solid_ps_dxbc, sizeof(g_solid_ps_dxbc), "main",
+                                          plume::RenderShaderFormat::DXBC);
+    }
+    pd.pixelShader = s.solid_ps.get();
+  }
   pd.primitiveTopology = HostTopology(Topology(key.topology));
 
   const uint32_t mode = key.mode_control;
@@ -2528,6 +2581,10 @@ plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, con
                         bd.dstBlendAlpha == plume::RenderBlend::ZERO &&
                         bd.blendOpAlpha == plume::RenderBlendOperation::ADD);
     bd.renderTargetWriteMask = uint8_t((key.color_mask >> (i * 4)) & 0xF);
+    if (REXCVAR_GET(debug_no_blend)) {
+      bd.blendEnabled = false;
+      bd.renderTargetWriteMask = 0xF;
+    }
     pd.renderTargetBlend[i] = bd;
   }
 
@@ -3765,12 +3822,29 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
   uint32_t draw_count = r.count;
   uint32_t first_index = 0;
   bool indexed = r.indexed;
+  int32_t quad_base_vertex = 0; // non-indexed quads from s.quad_indices
   std::unique_ptr<RectExpansion> rects;
   if (topology == Topology::kRects) {
     rects = ExpandRects(r, *decl, input->stream_mask);
     if (!rects || rects->indices.empty()) {
       ++s.skipped_draws;
       return;
+    }
+    if (s.dumping) {
+      for (uint32_t i = 0; i < kNullStream; ++i) {
+        const RectStream &rs = rects->streams[i];
+        if (rs.stride < 8 || rs.data.size() < 4 * rs.stride) {
+          continue;
+        }
+        std::string v;
+        for (uint32_t k = 0; k < 4; ++k) {
+          float xy[2];
+          std::memcpy(xy, rs.data.data() + k * rs.stride, 8);
+          v += fmt::format(" ({} {})", xy[0], xy[1]);
+        }
+        REXGPU_INFO("PGR4 D3D12 dump:   rect stream {} stride {} first rect xy{} indices {}", i, rs.stride, v,
+                    rects->indices.size());
+      }
     }
     UploadAllocation up = Video::Upload(rects->indices.data(), uint32_t(rects->indices.size() * 4), 4);
     if (!up) {
@@ -3832,6 +3906,40 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
       index_format = is32 ? plume::RenderFormat::R32_UINT : plume::RenderFormat::R16_UINT;
       first_index = r.first;
     }
+  } else if (topology == Topology::kQuads && REXCVAR_GET(quad_index_buffer)) {
+    const uint32_t quads = r.count / 4;
+    if (!quads) {
+      ++s.skipped_draws;
+      return;
+    }
+    if (quads > s.quad_index_quads) {
+      const uint32_t capacity = std::max(std::bit_ceil(quads), 16384u);
+      auto buffer = s.device->createBuffer(plume::RenderBufferDesc::IndexBuffer(
+          uint64_t(capacity) * 6 * 4, plume::RenderHeapType::UPLOAD));
+      if (!buffer) {
+        ++s.skipped_draws;
+        return;
+      }
+      buffer->setName("quad indices");
+      auto *out = static_cast<uint32_t *>(buffer->map());
+      for (uint32_t q = 0; q < capacity; ++q) {
+        const uint32_t v = q * 4;
+        const uint32_t pattern[6] = {v, v + 1, v + 2, v, v + 2, v + 3};
+        std::memcpy(out + q * 6, pattern, sizeof(pattern));
+      }
+      buffer->unmap();
+      if (s.quad_indices) {
+        Video::ParkUntilFence(std::move(s.quad_indices));
+      }
+      s.quad_indices = std::move(buffer);
+      s.quad_index_quads = capacity;
+    }
+    index_buffer = s.quad_indices.get();
+    index_size = quads * 6 * 4;
+    index_format = plume::RenderFormat::R32_UINT;
+    draw_count = quads * 6;
+    quad_base_vertex = int32_t(r.first);
+    indexed = true;
   } else if (topology == Topology::kFan || topology == Topology::kQuads) {
     auto expanded = ExpandIndices(topology, nullptr, r.count);
     for (auto &i : expanded) {
@@ -3879,6 +3987,15 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
     stream_mask = 0;
   } else if (r.up_data) {
     const uint32_t size = r.count * r.up_stride;
+    if (s.dumping && r.up_stride >= 8 && r.count >= 4) {
+      std::string v;
+      for (uint32_t k = 0; k < 4; ++k) {
+        v += fmt::format(" ({} {})", AsFloat(ReadU32(r.up_data + k * r.up_stride)),
+                         AsFloat(ReadU32(r.up_data + k * r.up_stride + 4)));
+      }
+      REXGPU_INFO("PGR4 D3D12 dump:   up stride {} first xy{} draw_count {} first_index {}", r.up_stride, v, draw_count,
+                  first_index);
+    }
     UploadAllocation up = Video::Upload(nullptr, size, 4);
     if (!up) {
       ++s.skipped_draws;
@@ -4131,6 +4248,7 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
     vs_shared.spec_constants |= kSpecR11G11B10Normal;
   }
   vs_shared.input_modes = input->input_modes;
+  vs_shared.input_missing = input->input_missing;
   const auto indexed_t0 = ProfNow();
   const int32_t fetch_safe = REXCVAR_GET(gpu_safe);
   if (vs->cached->indexed_fetch) {
@@ -4334,6 +4452,14 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
   vs_shared.pixel_scale[0] = ps_shared.pixel_scale[0] = 1.0f / res_scale.x;
   vs_shared.pixel_scale[1] = ps_shared.pixel_scale[1] = 1.0f / res_scale.y;
   phases.Lap(8);
+  if (s.dumping) {
+    REXGPU_INFO("PGR4 D3D12 dump:   vs c0 {} {} {} {} c1 {} {} {} {} ndc {} {} half {} {} squeeze {} pixel {} {}",
+                AsFloat(vs_consts[0]), AsFloat(vs_consts[1]), AsFloat(vs_consts[2]), AsFloat(vs_consts[3]),
+                AsFloat(vs_consts[4]), AsFloat(vs_consts[5]), AsFloat(vs_consts[6]), AsFloat(vs_consts[7]),
+                vs_shared.ndc_scale[0], vs_shared.ndc_scale[1], vs_shared.half_pixel_offset[0],
+                vs_shared.half_pixel_offset[1], vs_shared.ui_squeeze, vs_shared.pixel_scale[0],
+                vs_shared.pixel_scale[1]);
+  }
   const auto &vsc = UploadConstants(s.vs_constants, vs_consts, vs_regs * 16);
   const auto &psc = UploadConstants(s.ps_constants, ps_consts, ps_regs * 16);
   const auto &vss = UploadConstants(s.vs_shared, &vs_shared, sizeof(vs_shared));
@@ -4429,13 +4555,13 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
   }
 
   phases.Lap(9);
-  Video::NoteDraw({key.vs, key.ps, draw_count, indexed ? first_index : r.first,
-                   indexed && r.indexed && !rects ? int32_t(r.base_vertex) : 0, indexed});
+  const int32_t base_vertex = r.indexed && !rects ? r.base_vertex : quad_base_vertex;
+  Video::NoteDraw({key.vs, key.ps, draw_count, indexed ? first_index : r.first, indexed ? base_vertex : 0, indexed});
   if (indexed) {
     plume::RenderIndexBufferView ibv(plume::RenderBufferReference(index_buffer, index_offset), index_size,
                                      index_format);
     cmd->setIndexBuffer(&ibv);
-    cmd->drawIndexedInstanced(draw_count, 1, first_index, r.indexed && !rects ? r.base_vertex : 0, 0);
+    cmd->drawIndexedInstanced(draw_count, 1, first_index, base_vertex, 0);
   } else {
     cmd->drawInstanced(draw_count, 1, r.first, 0);
   }
@@ -4896,7 +5022,10 @@ static void PaceFrame() {
   static Clock::time_point next;
   static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                TIMER_ALL_ACCESS);
-  const int32_t limit = REXCVAR_GET(frame_rate_limit);
+  int32_t limit = REXCVAR_GET(frame_rate_limit);
+  if (pgr4::WalkCameraActive() && (limit <= 0 || limit > 30)) {
+    limit = 30;
+  }
   if (limit <= 0) {
     next = {};
     return;
@@ -5182,7 +5311,9 @@ void ExecSwap(uint32_t device, uint32_t front_buffer) {
     }
     dump_frames_left = std::min(frames, 64);
     s.dump_seq = 0;
-    DumpTweakables();
+    if (g_pgr4_title.load(std::memory_order_relaxed)) {
+      DumpTweakables(); // PGR4's registry; Geometry Wars has none
+    }
   }
   if (dump_frames_left > 0) {
     --dump_frames_left;

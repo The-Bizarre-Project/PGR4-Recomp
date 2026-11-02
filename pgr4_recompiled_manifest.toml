@@ -51,6 +51,8 @@ includes = [
 0x8278C8C0 = {}
 0x8291BD58 = {}
 0x8291BD60 = {}
+# Vtable stub (li r3,1; blr) at 0x821BF980 the analyser missed: crash log 018
+0x8252CCF8 = {}
 
 # Title update: this-adjust thunks (addi r3,r3,-N; b) reached through vtables
 0x827348E0 = {}

@@ -1,0 +1,58 @@
+# Geometry Wars: Waves, PGR4's arcade machine (gw.xex, title 4D5307F9), with
+# its title update: gw.xexp from PGR4's TU package beside a copy of gw.xex in
+# TitleUpdate/ (src/content/dlc.cpp), like default.xex.
+#
+# Linked into pgr4_recompiled as a second title: PGR4 launches it with
+# XamLoaderLaunchTitle("GAME:\gw.xex") and the app swaps the runtime over to
+# it (src/pgr4_recompiled_app.h). Both titles load at 0x82000000, so every GW symbol
+# carries the gw_ prefix (gw_sub_8205A5A8, gw_PPCImageConfig, ...).
+
+[project]
+name = "gw"
+sdk_version = "0.10.0"
+game_root = "../../PGR4-Files"
+
+[entrypoint]
+file_path = "../../PGR4-Files/TitleUpdate/gw.xex"
+out_directory_path = "generated"
+symbol_prefix = "gw_"
+# CRT setjmp/longjmp (same code as PGR4's): libjpeg's error exit longjmps back
+# out of the decoder.
+setjmp_address = 0x82107CD0
+longjmp_address = 0x82107890
+includes = [
+  "../config/gw_d3d_functions.toml",
+]
+
+[entrypoint.functions]
+# Tail-call (b) targets IDA and the scanner leave inside no function.
+0x821228A8 = {}
+0x8211B418 = {}
+# Reached only through a pointer built in code (no .pdata entry, not in data).
+0x820915C8 = {}
+# Reached only through pointers in .rdata/.data (vtables, this-adjust
+# thunks ending in bctr) at function boundaries the scanner left out.
+0x8203E200 = {}
+0x8205C6C0 = {}
+0x8205DE28 = {}
+0x8205DFA0 = {}
+0x82068414 = {}
+0x820AC740 = {}
+0x820CCA90 = {}
+0x820CCC08 = {}
+0x820CCD90 = {}
+0x820CCF08 = {}
+0x8210C9C8 = {}
+0x8211BA70 = {}
+0x821231F8 = {}
+0x82123228 = {}
+0x82125448 = {}
+0x82125468 = {}
+0x82125470 = {}
+0x82125490 = {}
+0x82125498 = {}
+0x82127A00 = {}
+0x8213B578 = {}
+0x8213B5C0 = {}
+# Sort comparator passed by address (lis/addi), after a call that never returns.
+0x820AA868 = {}
