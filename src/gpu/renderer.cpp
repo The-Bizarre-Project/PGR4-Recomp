@@ -1,6 +1,7 @@
 #include "gpu/renderer.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <immintrin.h>
 #include <cfloat>
@@ -44,6 +45,9 @@
 #include "gpu/texture_convert.h"
 #include "gpu/video.h"
 #include "solid_ps.dxbc.h"
+#include "present_vs.dxbc.h"
+#include "depth_resolve_ps.dxbc.h"
+#include "depth_copy_ps.dxbc.h"
 
 REXCVAR_DEFINE_BOOL(renderer_profile, false, "PGR4",
                     "Log per-stage renderer timings every 600 frames (costs some CPU per draw)");
@@ -75,6 +79,9 @@ REXCVAR_DEFINE_BOOL(buffer_recheck, true, "PGR4",
                     "Check big vertex/index buffers for changes every frame (sampled) instead of every 30 frames");
 REXCVAR_DEFINE_BOOL(gamma_ramp, true, "PGR4",
                     "Apply the game's display gamma ramp at present, as the 360 does (off: linear, paler)");
+REXCVAR_DEFINE_BOOL(gpu_verbose_log, false, "PGR4",
+                    "Log render target / resolve target creation and the frame, fps and memory "
+                    "statistics every 600 frames (diagnostics; off keeps the log short)");
 REXCVAR_DEFINE_BOOL(render_thread, true, "PGR4",
                     "Record the frame on a render thread; the game thread only copies what each call reads");
 REXCVAR_DEFINE_BOOL(render_ahead, true, "PGR4",
@@ -100,6 +107,10 @@ bool WalkCameraActive(); // walk_camera_pace.cpp
 
 REXCVAR_DEFINE_INT32(frame_rate_limit, 60, "PGR4",
                      "Frames per second the game may run at (0: unlimited; the 360 runs PGR4 at 30)");
+REXCVAR_DEFINE_INT32(msaa, 1, "PGR4",
+                     "Multisample anti-aliasing of the scene's render targets: 1 (off), 2, 4 or 8 samples "
+                     "(read at start-up)");
+REXCVAR_DEFINE_INT32(msaa_debug, 0, "PGR4", "Debug: MSAA bisection bits (1: no depth resolve pass)");
 REXCVAR_DEFINE_INT32(internal_resolution, 720, "PGR4",
                      "Internal rendering height: 720 (native), 1080, 1440 or 2160; every render target is scaled "
                      "by this over 720");
@@ -458,6 +469,11 @@ struct ResolvedTexture {
 
 struct RenderTarget {
   std::unique_ptr<plume::RenderTexture> texture;
+  uint32_t samples = 1; // MSAA (MsaaSamples)
+  // MSAA: single-sample copies the resolves go through (color), and the depth's view
+  // (ResolveMsaaDepth).
+  std::unique_ptr<plume::RenderTexture> resolve_scratch;
+  std::unique_ptr<plume::RenderTextureView> depth_view;
   plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
   uint32_t guest_format = 0; // RB_COLOR_INFO format (color targets)
   uint32_t width = 0; // guest size; the host texture is ScaledSize() of it
@@ -469,6 +485,7 @@ struct RenderTarget {
   // placed resources). NVIDIA and WARP hand back zeros; AMD hands back stale
   // memory, which the game then reads (e.g. last frame's exposure).
   bool needs_init = true;
+  uint64_t used_frame = 0; // EvictRenderTargets
   // EDRAM: every surface at the same EDRAM base is a view of the same memory
   // on the 360, so a clear through one is seen through the others. Each view
   // here is its own host texture; a clear of one is queued on the others and
@@ -2188,6 +2205,34 @@ std::array<float, 3> OutputRange(uint32_t color_format) {
 
 constexpr plume::RenderFormat kDepthFormat = plume::RenderFormat::D32_FLOAT_S8_UINT;
 
+// MSAA (--msaa): the sample count every color format and the depth format support, at most the
+// one asked for. Read once: targets and pipelines made with it stay.
+uint32_t MsaaSamples(RendererState &s) {
+  static uint32_t samples = 0;
+  if (samples) {
+    return samples;
+  }
+  uint32_t want = std::bit_floor(uint32_t(std::clamp(REXCVAR_GET(msaa), 1, 8)));
+  plume::RenderSampleCounts supported = s.device->getSampleCountsSupported(kDepthFormat);
+  for (uint32_t g = 0; g < 16; ++g) {
+    const plume::RenderFormat f = ColorTargetFormat(g);
+    if (f != plume::RenderFormat::UNKNOWN) {
+      supported &= s.device->getSampleCountsSupported(f);
+    }
+  }
+  while (want > 1 && !(supported & want)) {
+    want >>= 1;
+  }
+  samples = want;
+  REXGPU_INFO("PGR4 D3D12: MSAA {}x (asked {}x)", samples, REXCVAR_GET(msaa));
+  return samples;
+}
+
+// The targets MSAA applies to: the screen-sized ones (scene, its depth, the split-screen
+// views), not shadow maps' chains of small post-process targets. A color and depth target bound
+// together are the same size, so they agree.
+bool MsaaTarget(uint32_t width, uint32_t height) { return width >= 640 && height >= 360; }
+
 // PGR4's D3DSurface: +0x1C color/depth info (format in bits 16-19), +0x24
 // packed size ((width-1) << 18 | (height-1) << 3), from sub_826C8260.
 RenderTarget *RenderTargetFor(RendererState &s, uint32_t surface, bool depth) {
@@ -2216,6 +2261,7 @@ RenderTarget *RenderTargetFor(RendererState &s, uint32_t surface, bool depth) {
                                                             (uint64_t(format) << 1) | (depth ? 1 : 0));
   auto &rt = s.render_targets[key];
   if (rt && rt->width == width && rt->height == height && rt->format == format) {
+    rt->used_frame = s.frame;
     rt->edram_base = info & 0xFFF;
     rt->guest_format = (info >> 16) & 0xF; // depth: 24_8 or 24_8_FLOAT
     return rt.get();
@@ -2226,9 +2272,12 @@ RenderTarget *RenderTargetFor(RendererState &s, uint32_t surface, bool depth) {
   if (!cmd || width > 8192 || height > 8192 || host_width > 16384 || host_height > 16384) {
     return nullptr;
   }
+  const uint32_t samples = MsaaTarget(width, height) ? MsaaSamples(s) : 1;
   auto texture = s.device->createTexture(
-      depth ? plume::RenderTextureDesc::DepthTarget(host_width, host_height, format)
-            : plume::RenderTextureDesc::ColorTarget(host_width, host_height, format));
+      depth ? plume::RenderTextureDesc::DepthTarget(host_width, host_height, format,
+                                                    plume::RenderMultisampling(samples))
+            : plume::RenderTextureDesc::ColorTarget(host_width, host_height, format,
+                                                    plume::RenderMultisampling(samples)));
   if (!texture) {
     return nullptr;
   }
@@ -2244,6 +2293,9 @@ RenderTarget *RenderTargetFor(RendererState &s, uint32_t surface, bool depth) {
     rt = std::make_unique<RenderTarget>();
   }
   rt->texture = std::move(texture);
+  if (rt->resolve_scratch) Video::ParkUntilFence(std::move(rt->resolve_scratch));
+  if (rt->depth_view) Video::ParkUntilFence(std::move(rt->depth_view));
+  rt->samples = samples;
   rt->format = format;
   rt->width = width;
   rt->height = height;
@@ -2254,8 +2306,11 @@ RenderTarget *RenderTargetFor(RendererState &s, uint32_t surface, bool depth) {
   rt->clear_pending = false;
   rt->guest_format = (info >> 16) & 0xF;
   rt->id = s.next_id++;
-  REXGPU_INFO("PGR4 D3D12: {} target {:08X} {}x{} format {}", depth ? "depth" : "color", surface,
-              width, height, int(format));
+  rt->used_frame = s.frame;
+  if (REXCVAR_GET(gpu_verbose_log)) {
+    REXGPU_INFO("PGR4 D3D12: {} target {:08X} {}x{} format {}", depth ? "depth" : "color", surface,
+                width, height, int(format));
+  }
   return rt.get();
 }
 
@@ -2278,6 +2333,12 @@ Targets CurrentTargets(RendererState &s, uint32_t device) {
     t.color[t.color_count++] = rt;
   }
   t.depth = RenderTargetFor(s, ReadU32(device + dev::kDepthStencil), true);
+  // MSAA: a pass into small targets with the scene's depth still bound (the exposure chain's
+  // 64x64 ... 1x1 draws) cannot pair a single-sample color target with the multisampled depth;
+  // those passes draw without depth, which they do not test.
+  if (t.depth && t.color_count && t.depth->samples != t.color[0]->samples) {
+    t.depth = nullptr;
+  }
   if (t.color_count) {
     t.width = t.color[0]->width;
     t.height = t.color[0]->height;
@@ -2297,6 +2358,21 @@ plume::RenderFramebuffer *BindFramebuffer(RendererState &s, plume::RenderCommand
     key = key * 0x100000001B3ull + t.color[i]->id;
   }
   key = key * 31 + t.color_count;
+  // Targets bound together must have one sample count (MsaaTarget picks by size).
+  const uint32_t samples = t.color_count ? t.color[0]->samples : t.depth ? t.depth->samples : 1;
+  bool mixed = t.depth && t.depth->samples != samples;
+  for (uint32_t i = 0; i < t.color_count; ++i) {
+    mixed = mixed || t.color[i]->samples != samples;
+  }
+  if (mixed) {
+    if (LogOnce(s, 0x9000000000ull ^ (uint64_t(t.color_count ? t.color[0]->width : 0) << 24) ^
+                       (uint64_t(t.depth ? t.depth->width : 0) << 8) ^ (t.depth ? t.depth->height : 0))) {
+      REXGPU_WARN("PGR4 D3D12: MSAA mismatch: color {}x{} ({}x) with depth {}x{} ({}x)",
+                  t.color_count ? t.color[0]->width : 0, t.color_count ? t.color[0]->height : 0, samples,
+                  t.depth ? t.depth->width : 0, t.depth ? t.depth->height : 0, t.depth ? t.depth->samples : 0);
+    }
+    return nullptr;
+  }
   auto &fb = s.framebuffers[key];
   if (!fb) {
     const plume::RenderTexture *colors[4] = {};
@@ -2340,6 +2416,45 @@ plume::RenderFramebuffer *BindFramebuffer(RendererState &s, plume::RenderCommand
 // the other views there no longer stands: the shadow pass clears to 1 and
 // then draws, and its clear reaching the reflection cube's reversed-Z depth
 // left a cube face empty (red car windows in the menus).
+// PGR4 allocates its surfaces anew for each race and menu, at new guest
+// addresses, and the cache is keyed by surface: the host targets of every
+// earlier race stayed allocated (283 of them after an evening of races).
+// A target no draw has bound for a minute goes, with every framebuffer (they
+// are rebuilt on demand); EDRAM contents left that long are not read again.
+void EvictRenderTargets(RendererState &s) {
+  constexpr uint64_t kUnusedFrames = 3600;
+  if (s.frame < kUnusedFrames) {
+    return;
+  }
+  size_t evicted = 0;
+  for (auto it = s.render_targets.begin(); it != s.render_targets.end();) {
+    RenderTarget *rt = it->second.get();
+    if (rt && s.frame - rt->used_frame < kUnusedFrames) {
+      ++it;
+      continue;
+    }
+    if (rt) {
+      std::erase(s.shared_clears, rt);
+      if (rt->depth_view) Video::ParkUntilFence(std::move(rt->depth_view));
+      if (rt->resolve_scratch) Video::ParkUntilFence(std::move(rt->resolve_scratch));
+      Video::ParkUntilFence(std::move(rt->texture));
+    }
+    it = s.render_targets.erase(it);
+    ++evicted;
+  }
+  if (!evicted) {
+    return;
+  }
+  for (auto &[_, fb] : s.framebuffers) {
+    Video::ParkUntilFence(std::move(fb));
+  }
+  s.framebuffers.clear();
+  s.bound_framebuffer = nullptr;
+  s.bound = {};
+  REXGPU_INFO("PGR4 D3D12: evicted {} render targets unused for {} frames, {} left", evicted, kUnusedFrames,
+              s.render_targets.size());
+}
+
 void NoteDepthDraw(RendererState &s, const RenderTarget *depth) {
   if (s.shared_clears.empty() || !depth) {
     return;
@@ -2502,25 +2617,21 @@ struct PipelineKey {
   uint32_t mode_control = 0;
   float depth_bias = 0;       // PA_SU_POLY_OFFSET_FRONT_OFFSET when enabled
   float depth_bias_slope = 0; // PA_SU_POLY_OFFSET_FRONT_SCALE when enabled
+  uint32_t samples = 1;       // the targets' MSAA sample count
 };
 
-plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, const HostShader *vs,
-                                   const HostShader *ps, const InputBinding &input) {
-  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
-  auto it = s.pipelines.find(hash);
-  if (it != s.pipelines.end()) {
-    return it->second.get();
-  }
+// A graphics pipeline for a key.
+std::unique_ptr<plume::RenderPipeline> CreatePipeline(plume::RenderDevice *device,
+                                                      plume::RenderPipelineLayout *layout,
+                                                      plume::RenderShader *solid_ps, const PipelineKey &key,
+                                                      plume::RenderShader *vs, plume::RenderShader *ps,
+                                                      const InputBinding &input) {
   plume::RenderGraphicsPipelineDesc pd;
-  pd.pipelineLayout = s.layout.get();
-  pd.vertexShader = vs->shader.get();
-  pd.pixelShader = ps ? ps->shader.get() : nullptr;
-  if (REXCVAR_GET(debug_solid_ps)) {
-    if (!s.solid_ps) {
-      s.solid_ps = s.device->createShader(g_solid_ps_dxbc, sizeof(g_solid_ps_dxbc), "main",
-                                          plume::RenderShaderFormat::DXBC);
-    }
-    pd.pixelShader = s.solid_ps.get();
+  pd.pipelineLayout = layout;
+  pd.vertexShader = vs;
+  pd.pixelShader = ps;
+  if (solid_ps) {
+    pd.pixelShader = solid_ps;
   }
   pd.primitiveTopology = HostTopology(Topology(key.topology));
 
@@ -2533,6 +2644,7 @@ plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, con
   pd.frontFace = (mode >> 2) & 1 ? plume::RenderFrontFace::CLOCKWISE
                                  : plume::RenderFrontFace::COUNTER_CLOCKWISE;
   pd.depthClipEnabled = true;
+  pd.multisampling = plume::RenderMultisampling(key.samples);
 
   const uint32_t dc = key.depth_control;
   if (key.depth_format) {
@@ -2600,13 +2712,38 @@ plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, con
   pd.inputElements = input.elements.data();
   pd.inputElementsCount = uint32_t(input.elements.size());
 
-  auto pipeline = s.device->createGraphicsPipeline(pd);
+  auto pipeline = device->createGraphicsPipeline(pd);
   if (pipeline && !static_cast<plume::D3D12GraphicsPipeline *>(pipeline.get())->d3d) {
     pipeline.reset();
   }
   if (!pipeline) {
     REXGPU_WARN("PGR4 D3D12: pipeline creation failed (vs {:016X} ps {:016X} rt {} depth {})",
                 key.vs, key.ps, key.rt_count, key.depth_format);
+  }
+  return pipeline;
+}
+
+plume::RenderPipeline *PipelineFor(RendererState &s, const PipelineKey &key, const HostShader *vs,
+                                   const HostShader *ps, const InputBinding &input) {
+  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+  auto it = s.pipelines.find(hash);
+  if (it != s.pipelines.end()) {
+    return it->second.get();
+  }
+  if (REXCVAR_GET(debug_solid_ps) && !s.solid_ps) {
+    s.solid_ps = s.device->createShader(g_solid_ps_dxbc, sizeof(g_solid_ps_dxbc), "main",
+                                        plume::RenderShaderFormat::DXBC);
+  }
+  plume::RenderShader *solid_ps = REXCVAR_GET(debug_solid_ps) ? s.solid_ps.get() : nullptr;
+  plume::RenderShader *vs_shader = vs->shader.get(), *ps_shader = ps ? ps->shader.get() : nullptr;
+  auto pipeline = CreatePipeline(s.device, s.layout.get(), solid_ps, key, vs_shader, ps_shader, input);
+  // Diagnostic: a pipeline count that keeps growing means some key field keeps changing.
+  if (const size_t n = s.pipelines.size() + 1; n >= 4000 && n % 1000 == 0) {
+    REXGPU_WARN("PGR4 D3D12: {} pipelines; newest vs {:016X} ps {:016X} decl {:016X} rt {} [{:X} {:X}] depth {} "
+                "topo {} blend {:08X} mask {:X} zctl {:08X} stencil {:06X} mode {:X} bias {} slope {}",
+                n, key.vs, key.ps, key.decl, key.rt_count, key.rt_formats[0], key.rt_formats[1],
+                key.depth_format, key.topology, key.blend[0], key.color_mask, key.depth_control,
+                key.stencil_front, key.mode_control, key.depth_bias, key.depth_bias_slope);
   }
   return s.pipelines.emplace(hash, std::move(pipeline)).first->second.get();
 }
@@ -3752,6 +3889,7 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
     key.rt_formats[i] = uint32_t(targets.color[i]->format);
   }
   key.depth_format = targets.depth ? uint32_t(kDepthFormat) : 0;
+  key.samples = targets.color_count ? targets.color[0]->samples : targets.depth ? targets.depth->samples : 1;
   key.topology = uint32_t(topology == Topology::kFan || topology == Topology::kQuads ||
                                   topology == Topology::kRects || topology == Topology::kStrip32
                               ? Topology::kTriangles
@@ -3787,6 +3925,37 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
   const float depth_offset = float_depth ? 0.0f : key.depth_bias;
   if (!float_depth) {
     key.depth_bias = 0; // not part of the pipeline (depth_offset)
+  }
+  // Only state the host pipeline uses goes in the key: register bits for
+  // unused targets, disabled stencil or depth, and the stencil reference
+  // (set per draw below) made a new pipeline for every combination, 140,000
+  // of them and 28 GB after an evening of races.
+  const bool stencil = key.depth_format && (key.depth_control & 1);
+  const uint32_t stencil_ref = stencil ? key.stencil_front & 0xFF : 0;
+  key.stencil_front = stencil ? key.stencil_front & 0xFFFF00 : 0;
+  key.stencil_back = 0; // PipelineFor never reads it
+  if (!key.depth_format) {
+    key.depth_control = 0;
+    key.depth_bias = 0;
+    key.depth_bias_slope = 0;
+  } else {
+    if (!stencil) {
+      key.depth_control &= 0x76;
+    }
+    if (!((key.depth_control >> 1) & 1)) {
+      key.depth_control &= ~0x76u;
+    }
+  }
+  // Depth bias values that differ in their last bits (shadow passes) share a pipeline: rounded
+  // to 8 mantissa bits. A tester's 34-minute session made 36,000 pipelines.
+  auto round_bias = [](float v) {
+    return std::bit_cast<float>((std::bit_cast<uint32_t>(v) + 0x4000u) & 0xFFFF8000u);
+  };
+  key.depth_bias = round_bias(key.depth_bias);
+  key.depth_bias_slope = round_bias(key.depth_bias_slope);
+  key.color_mask &= targets.color_count >= 4 ? ~0u : (1u << (targets.color_count * 4)) - 1;
+  for (uint32_t i = 0; i < 4; ++i) {
+    key.blend[i] = i < targets.color_count && ((key.color_mask >> (i * 4)) & 0xF) ? key.blend[i] & 0x1FFF1FFF : 0;
   }
   if (s.dumping) {
     REXGPU_INFO("PGR4 D3D12 dump: draw {} prim {} count {} vs {:016X} ps {:016X} rt {}x{} n{} depth {} "
@@ -4557,6 +4726,13 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
   phases.Lap(9);
   const int32_t base_vertex = r.indexed && !rects ? r.base_vertex : quad_base_vertex;
   Video::NoteDraw({key.vs, key.ps, draw_count, indexed ? first_index : r.first, indexed ? base_vertex : 0, indexed});
+  // The stencil reference is not in the pipeline (every pipeline has 0, which
+  // Plume sets when it binds one), so it is set around the draw and put back.
+  auto *d3d_cmd = static_cast<plume::D3D12CommandList *>(cmd);
+  if (stencil_ref) {
+    d3d_cmd->d3d->OMSetStencilRef(stencil_ref);
+    d3d_cmd->activeStencilRef = 0; // what Plume compares the pipeline's 0 with at the draw
+  }
   if (indexed) {
     plume::RenderIndexBufferView ibv(plume::RenderBufferReference(index_buffer, index_offset), index_size,
                                      index_format);
@@ -4564,6 +4740,9 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
     cmd->drawIndexedInstanced(draw_count, 1, first_index, base_vertex, 0);
   } else {
     cmd->drawInstanced(draw_count, 1, r.first, 0);
+  }
+  if (stencil_ref) {
+    d3d_cmd->d3d->OMSetStencilRef(0);
   }
   Video::NoteDrawDone();
 
@@ -4583,7 +4762,8 @@ void ExecuteDraw(RendererState &s, const DrawRequest &r) {
       std::fclose(rf);
     }
   }
-  if (s.dumping && targets.color_count && targets.width == 1280 && s.draws_since_resolve >= dump_from &&
+  if (s.dumping && targets.color_count && targets.color[0]->samples == 1 && targets.width == 1280 &&
+      s.draws_since_resolve >= dump_from &&
       (s.draws_since_resolve - dump_from) % dump_every == 0 &&
       s.draws_since_resolve - dump_from <= 100 * dump_every) {
     char name[64];
@@ -4816,6 +4996,101 @@ void ExecEndTiling(uint32_t device, uint32_t flags, uint32_t dest_texture, uint3
   s.bound = {};
 }
 
+// MSAA depth resolve: a full-screen pass writing sample 0 of `src` as the depth of `dst` (a
+// single-sample depth target of the same size). D3D12 resolves no depth formats.
+void ResolveMsaaDepth(RendererState &s, plume::RenderCommandList *cmd, RenderTarget &src,
+                      plume::RenderTexture *dst) {
+  // src.samples == 1: a plain copy into a larger depth texture (depth_copy_ps).
+  const bool single = src.samples <= 1;
+  struct Pass {
+    std::unique_ptr<plume::RenderPipelineLayout> layout;
+    std::unique_ptr<plume::RenderShader> vs, ps;
+    std::unique_ptr<plume::RenderPipeline> pipeline;
+    bool tried = false;
+  };
+  static Pass passes[2];
+  Pass &pass = passes[single ? 1 : 0];
+  auto set_layout = [](plume::RenderDescriptorSetBuilder &b) {
+    b.begin();
+    b.addTexture(0);
+    b.end();
+  };
+  if (!pass.tried) {
+    pass.tried = true;
+    plume::RenderDescriptorSetBuilder sb;
+    set_layout(sb);
+    plume::RenderPipelineLayoutBuilder lb;
+    lb.begin(false, false);
+    lb.addDescriptorSet(sb);
+    lb.end();
+    pass.layout = lb.create(s.device);
+    pass.vs = s.device->createShader(g_present_vs_dxbc, sizeof(g_present_vs_dxbc), "main",
+                                     plume::RenderShaderFormat::DXBC);
+    pass.ps = single ? s.device->createShader(g_depth_copy_ps_dxbc, sizeof(g_depth_copy_ps_dxbc), "main",
+                                              plume::RenderShaderFormat::DXBC)
+                     : s.device->createShader(g_depth_resolve_ps_dxbc, sizeof(g_depth_resolve_ps_dxbc), "main",
+                                              plume::RenderShaderFormat::DXBC);
+    if (pass.layout && pass.vs && pass.ps) {
+      plume::RenderGraphicsPipelineDesc pd;
+      pd.pipelineLayout = pass.layout.get();
+      pd.vertexShader = pass.vs.get();
+      pd.pixelShader = pass.ps.get();
+      pd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+      pd.cullMode = plume::RenderCullMode::NONE;
+      pd.renderTargetCount = 0;
+      pd.depthTargetFormat = kDepthFormat;
+      pd.depthEnabled = true;
+      pd.depthWriteEnabled = true;
+      pd.depthFunction = plume::RenderComparisonFunction::ALWAYS;
+      pass.pipeline = s.device->createGraphicsPipeline(pd);
+      if (pass.pipeline && !static_cast<plume::D3D12GraphicsPipeline *>(pass.pipeline.get())->d3d) {
+        pass.pipeline.reset();
+      }
+    }
+    if (!pass.pipeline) {
+      REXGPU_WARN("PGR4 D3D12: MSAA depth resolve pipeline failed; depth copies of MSAA targets skipped");
+    }
+  }
+  if (!pass.pipeline) {
+    return;
+  }
+  if (!src.depth_view) {
+    plume::RenderTextureViewDesc vd;
+    vd.format = kDepthFormat;
+    vd.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+    vd.mipLevels = 1;
+    src.depth_view = src.texture->createTextureView(vd);
+    if (!src.depth_view) {
+      return;
+    }
+  }
+  plume::RenderDescriptorSetBuilder sb;
+  set_layout(sb);
+  auto set = sb.create(s.device);
+  auto fb = s.device->createFramebuffer(plume::RenderFramebufferDesc(nullptr, 0, dst));
+  if (!set || !fb) {
+    return;
+  }
+  const plume::RenderTextureBarrier before[] = {
+      plume::RenderTextureBarrier(src.texture.get(), plume::RenderTextureLayout::SHADER_READ),
+      plume::RenderTextureBarrier(dst, plume::RenderTextureLayout::DEPTH_WRITE)};
+  cmd->barriers(plume::RenderBarrierStage::GRAPHICS, before, 2);
+  set->setTexture(0, src.texture.get(), plume::RenderTextureLayout::SHADER_READ, src.depth_view.get());
+  const uint32_t w = ScaledSize(src.width, src.scale.x), h = ScaledSize(src.height, src.scale.y);
+  cmd->setFramebuffer(fb.get());
+  cmd->setViewports(plume::RenderViewport(0.0f, 0.0f, float(w), float(h)));
+  cmd->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
+  cmd->setPipeline(pass.pipeline.get());
+  cmd->setGraphicsPipelineLayout(pass.layout.get());
+  cmd->setGraphicsDescriptorSet(set.get(), 0);
+  cmd->drawInstanced(3, 1, 0, 0);
+  Video::ParkUntilFence(std::move(set));
+  Video::ParkUntilFence(std::move(fb));
+  // The renderer binds its own framebuffer, layout, pipeline and sets again.
+  s.bound_framebuffer = nullptr;
+  s.bound = {};
+}
+
 void ExecResolve(uint32_t device, uint32_t flags, uint32_t source_rect, uint32_t dest_texture,
                        uint32_t dest_point, uint32_t dest_level, uint32_t dest_slice, uint32_t clear_color,
                        float clear_z) {
@@ -4889,7 +5164,9 @@ void ExecResolve(uint32_t device, uint32_t flags, uint32_t source_rect, uint32_t
         r->id = s.next_id++;
         cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
                       plume::RenderTextureBarrier(r->texture.get(), plume::RenderTextureLayout::SHADER_READ));
-        REXGPU_INFO("PGR4 D3D12: resolve target {:08X} {}x{}{}", base, dw, dh, from_depth ? " (depth)" : "");
+        if (REXCVAR_GET(gpu_verbose_log)) {
+          REXGPU_INFO("PGR4 D3D12: resolve target {:08X} {}x{}{}", base, dw, dh, from_depth ? " (depth)" : "");
+        }
       }
     }
     if (r && r->texture) {
@@ -4940,10 +5217,18 @@ void ExecResolve(uint32_t device, uint32_t flags, uint32_t source_rect, uint32_t
             plume::RenderTextureBarrier(src->texture.get(), plume::RenderTextureLayout::COPY_SOURCE),
             plume::RenderTextureBarrier(r->texture.get(), plume::RenderTextureLayout::COPY_DEST)};
         cmd->barriers(plume::RenderBarrierStage::COPY, before, 2);
-        if (from_depth) {
-          // Depth copies must cover whole subresources.
+        if (from_depth && src->samples > 1) {
+          // MSAA depth: D3D12 copies and resolves no multisampled depth; sample 0 is drawn.
+          if (r->width >= src->width && r->height >= src->height && r->scale == src->scale &&
+              !(REXCVAR_GET(msaa_debug) & 1)) {
+            ResolveMsaaDepth(s, cmd, *src, r->texture.get());
+          }
+        } else if (from_depth) {
+          // Depth copies must cover whole subresources; into a larger texture it is drawn.
           if (r->width == src->width && r->height == src->height) {
             cmd->copyTexture(r->texture.get(), src->texture.get());
+          } else if (r->width >= src->width && r->height >= src->height && r->scale == src->scale) {
+            ResolveMsaaDepth(s, cmd, *src, r->texture.get());
           }
         } else {
           // Guest rectangle to host pixels, kept inside both textures.
@@ -4956,10 +5241,35 @@ void ExecResolve(uint32_t device, uint32_t flags, uint32_t source_rect, uint32_t
                                         hy0 + int32_t(std::max(1u, hh >> level)) - hdy});
           if (hx1 > hx0 && hy1 > hy0) {
             const plume::RenderBox box(hx0, hy0, hx1, hy1);
-            cmd->copyTextureRegion(
-                plume::RenderTextureCopyLocation::Subresource(r->texture.get(), level,
-                                                              r->cube ? std::min(dest_slice, 5u) : 0),
-                plume::RenderTextureCopyLocation::Subresource(src->texture.get()), uint32_t(hdx), uint32_t(hdy), 0, &box);
+            // MSAA: the target is averaged into its single-sample scratch first.
+            const plume::RenderTexture *copy_from = src->texture.get();
+            if (src->samples > 1) {
+              if (!src->resolve_scratch) {
+                src->resolve_scratch = s.device->createTexture(plume::RenderTextureDesc::ColorTarget(
+                    ScaledSize(src->width, src->scale.x), ScaledSize(src->height, src->scale.y), src->format));
+              }
+              if (src->resolve_scratch) {
+                const plume::RenderTextureBarrier to_resolve[] = {
+                    plume::RenderTextureBarrier(src->texture.get(), plume::RenderTextureLayout::RESOLVE_SOURCE),
+                    plume::RenderTextureBarrier(src->resolve_scratch.get(), plume::RenderTextureLayout::RESOLVE_DEST)};
+                cmd->barriers(plume::RenderBarrierStage::COPY, to_resolve, 2);
+                // The whole subresource: ResolveSubresourceRegion needs programmable sample
+                // positions (not on a GT 710 and other older GPUs).
+                cmd->resolveTexture(src->resolve_scratch.get(), src->texture.get());
+                cmd->barriers(plume::RenderBarrierStage::COPY,
+                              plume::RenderTextureBarrier(src->resolve_scratch.get(),
+                                                          plume::RenderTextureLayout::COPY_SOURCE));
+                copy_from = src->resolve_scratch.get();
+              } else {
+                copy_from = nullptr;
+              }
+            }
+            if (copy_from) {
+              cmd->copyTextureRegion(
+                  plume::RenderTextureCopyLocation::Subresource(r->texture.get(), level,
+                                                                r->cube ? std::min(dest_slice, 5u) : 0),
+                  plume::RenderTextureCopyLocation::Subresource(copy_from), uint32_t(hdx), uint32_t(hdy), 0, &box);
+            }
           }
         }
         const plume::RenderTextureBarrier after[] = {
@@ -4982,7 +5292,7 @@ void ExecResolve(uint32_t device, uint32_t flags, uint32_t source_rect, uint32_t
                     ReadTextureFetch(GuestVirtual(dest_texture + 0x1C)).BaseAddress());
       Video::CaptureTexture(dumped_resolve->texture.get(), ScaledSize(dumped_resolve->width, dumped_resolve->scale.x),
                             ScaledSize(dumped_resolve->height, dumped_resolve->scale.y), name);
-    } else if (dumped_resolve && dumped_resolve->cube && src) {
+    } else if (dumped_resolve && dumped_resolve->cube && src && src->samples == 1) {
       char name[64];
       std::snprintf(name, sizeof(name), "dump_%03u_cube%u", s.dump_seq, dest_slice);
       Video::CaptureTexture(src->texture.get(), ScaledSize(src->width, src->scale.x),
@@ -5198,6 +5508,8 @@ void ExecSwap(uint32_t device, uint32_t front_buffer) {
                   s.textures.size(), s.sets.size(), st.indexed_ns * 1e-6 / 600.0, st.indexed_draws / 600,
                   st.new_stream_sets / 600);
     }
+    EvictRenderTargets(s);
+    if (REXCVAR_GET(gpu_verbose_log)) {
     // Memory: what each cache holds, to find what grows.
     uint64_t buffer_bytes = 0, texture_bytes = 0, pool_bytes = 0;
     size_t pooled = 0;
@@ -5222,6 +5534,7 @@ void ExecSwap(uint32_t device, uint32_t front_buffer) {
                 pmc.PrivateUsage >> 20, s.buffers.size(), buffer_bytes >> 20, pooled, pool_bytes >> 20,
                 s.textures.size(), texture_bytes >> 20, s.resolved.size(), s.render_targets.size(),
                 s.framebuffers.size(), s.pipelines.size(), s.sets.size(), s.stream_sets.size());
+    }
     g_stream_stats = {};
   }
   Video::PresentSource source;
@@ -5241,7 +5554,7 @@ void ExecSwap(uint32_t device, uint32_t front_buffer) {
         REXGPU_WARN("PGR4 D3D12: front buffer {:08X} has no resolved copy", f.BaseAddress());
       }
     }
-    if (s.ready && (s.frame % 600) == 0) {
+    if (s.ready && (s.frame % 600) == 0 && REXCVAR_GET(gpu_verbose_log)) {
       REXGPU_INFO("PGR4 D3D12: frame {}: {} draws, {} skipped, {} pipelines, {} textures, {} set views ({} stream sets), {} views free, {} write callbacks",
                   s.frame, s.draws, s.skipped_draws, s.pipelines.size(), s.textures.size(), s.set_views, s.stream_sets.size(), FreeViews(s),
                   g_watch_writes.exchange(0, std::memory_order_relaxed));
@@ -6151,6 +6464,8 @@ void Renderer::ResetForTitleSwitch() {
   s.framebuffers.clear();
   for (auto &[_, rt] : s.render_targets) {
     if (rt) {
+      if (rt->depth_view) Video::ParkUntilFence(std::move(rt->depth_view));
+      if (rt->resolve_scratch) Video::ParkUntilFence(std::move(rt->resolve_scratch));
       Video::ParkUntilFence(std::move(rt->texture));
     }
   }

@@ -16,6 +16,7 @@
 #include <utility>
 
 namespace plume {
+enum class RenderFormat;
 struct RenderBuffer;
 struct RenderCommandList;
 struct RenderDescriptorSet;
@@ -58,6 +59,19 @@ public:
   // unset, the swapchain's when narrower than 16:9 (the Steam Deck's 16:10).
   // 0 keeps 16:9. Fixed at the first call, after the swapchain exists.
   static double DisplayAspect();
+
+  // HDR output (--hdr_output): the swapchain is FP16 scRGB instead of 8-bit
+  // sRGB. Fixed once the swapchain exists.
+  static plume::RenderFormat BackBufferFormat();
+  // What the present and overlay shaders take to map the 360's SDR image to
+  // the HDR display (push constant b0/b1, space2). paper_scale 0: SDR.
+  struct HdrParams {
+    float paper_scale = 0.0f;    // the game's white in scRGB units (nits / 80)
+    float highlight_gain = 0.0f; // white lifted to (1 + gain) x paper white
+    float highlight_power = 4.0f; // how much of the range below white is lifted
+    float pad = 0.0f;
+  };
+  static HdrParams Hdr();
 
   // D3DDevice_Swap: finish and present the frame being recorded. source is
   // the guest front buffer's host copy (drawn letterboxed into the swapchain,

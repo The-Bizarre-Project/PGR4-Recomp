@@ -112,7 +112,8 @@ SHARED_TAIL = (
     "\tfloat3 g_OutputRange : packoffset(c29.y);\n"
     "\tfloat g_DepthOffset : packoffset(c30.x);\n"
     "\tfloat g_UiSqueezeY : packoffset(c30.y);\n"
-    "\tfloat g_UiEdgeShiftY : packoffset(c30.z);"
+    "\tfloat g_UiEdgeShiftY : packoffset(c30.z);\n"
+    "\tuint g_InputMissing : packoffset(c30.w);"
 )
 
 

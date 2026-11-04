@@ -225,7 +225,13 @@ float4 pgr4FetchR11G11B10(uint4 value, uint specConstants)
 // 10:10:10:2 in .x (DEC3N/DEC4N). Xenos converts these in the fetch, which no
 // DXGI format does.
 #define PGR4_INPUT_MODE(INDEX) ((g_InputModes >> ((INDEX) * 2)) & 3)
-#define pgr4InputFloat(RAW, INDEX) pgr4DecodeInput((RAW), PGR4_INPUT_MODE(INDEX))
+// Components the input's vertex format lacks (g_InputMissing, 2 bits per
+// input): filled as the Xenos does, 0 for y and z, 1 for w. The input
+// assembler's own fill is not used: for a uint4 input AMD's drivers under
+// vkd3d-proton give integer 1 for a float format's w, which decodes to ~0.
+#define PGR4_INPUT_MISSING(INDEX) ((g_InputMissing >> ((INDEX) * 2)) & 3)
+#define pgr4InputFloat(RAW, INDEX) \
+    pgr4PadInput(pgr4DecodeInput((RAW), PGR4_INPUT_MODE(INDEX)), PGR4_INPUT_MISSING(INDEX))
 #define pgr4InputBits(RAW, INDEX) asuint(pgr4DecodeInput((RAW), PGR4_INPUT_MODE(INDEX)))
 #define pgr4InputIndex(RAW, INDEX) pgr4DecodeIndex((RAW), PGR4_INPUT_MODE(INDEX))
 
@@ -241,6 +247,12 @@ float4 pgr4DecodeInput(uint4 raw, uint mode)
         return max(float4(v) / float4(511.0, 511.0, 511.0, 1.0), -1.0);
     }
     return asfloat(raw);
+}
+
+float4 pgr4PadInput(float4 value, uint missing)
+{
+    return float4(value.x, missing > 2 ? 0.0 : value.y, missing > 1 ? 0.0 : value.z,
+                  missing > 0 ? 1.0 : value.w);
 }
 
 uint4 pgr4DecodeIndex(uint4 raw, uint mode)

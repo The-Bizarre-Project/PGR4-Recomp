@@ -31,6 +31,7 @@
 #include "gpu/imgui_drawer.h"
 #include "gpu/renderer.h"
 #include "gpu/video.h"
+#include "speedo.h"
 #elif PGR4_NATIVE_RENDERER
 #include "render/graphics_system.h"
 #endif
@@ -147,6 +148,9 @@ protected:
       pgr4::gpu::Video::CreateHostDevice(window()->GetNativeWindowHandle());
     }
     InstallOverlayDrawHook();
+    pgr4::speedo::Install(imgui_drawer(), [this](std::function<void()> f) {
+      app_context().CallInUIThread(std::move(f));
+    });
   }
 
   // Title id is known once the module is loaded; the guest has not run yet.

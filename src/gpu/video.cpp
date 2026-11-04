@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <plume_d3d12.h>
+#include <dxgi1_6.h>
 #include <plume_render_interface.h>
 #include <plume_render_interface_builders.h>
 
@@ -33,8 +34,20 @@ REXCVAR_DEFINE_STRING(gpu_adapter, "", "PGR4",
 REXCVAR_DEFINE_BOOL(gpu_crash_report, false, "PGR4",
                     "On a GPU crash, log the draw it happened in and, with DRED, the faulting resource (slows the GPU)");
 REXCVAR_DECLARE(double, aspect_ratio);
+REXCVAR_DECLARE(bool, gpu_verbose_log);
+REXCVAR_DEFINE_BOOL(fxaa, false, "PGR4", "FXAA anti-aliasing on the final image (smooths jagged edges)");
 REXCVAR_DEFINE_BOOL(gpu_sync, false, "PGR4",
                     "Debug: wait for the GPU to finish each frame after presenting it (no frame in flight)");
+REXCVAR_DEFINE_STRING(hdr_output, "auto", "PGR4",
+                      "HDR output: auto (when Windows HDR is on for the game's display), on or off");
+REXCVAR_DEFINE_DOUBLE(hdr_paper_white, 200.0, "PGR4",
+                      "HDR: brightness of the game's white in nits (Windows' SDR content brightness is "
+                      "usually 80-250)");
+REXCVAR_DEFINE_DOUBLE(hdr_peak, 0.0, "PGR4",
+                      "HDR: brightest highlight in nits (0: the display's own peak, at most 1000)");
+REXCVAR_DEFINE_DOUBLE(hdr_highlights, 1.0, "PGR4",
+                      "HDR: how far highlights are lifted towards the peak (0: none, the SDR image at "
+                      "paper white; 1: full)");
 
 #include "present_ps.dxbc.h"
 #include "present_vs.dxbc.h"
@@ -124,6 +137,11 @@ struct VideoState {
   std::unique_ptr<plume::RenderTextureView> gamma_view;
   std::array<uint16_t, 256 * 4> gamma_texels{};
   bool gamma_uploaded = false;
+
+  // HDR output (hdr_output): an FP16 scRGB swapchain; the present shader
+  // expands the 360's SDR image (Video::HdrConstants).
+  bool hdr = false;
+  float display_peak_nits = 0.0f; // from DXGI, 0 if unknown
 
   // D3D12 debug layer messages (PGR4_D3D12_DEBUG=1), drained into the log.
   ID3D12InfoQueue *info_queue = nullptr;
@@ -543,6 +561,7 @@ bool BuildPresentPipeline(VideoState &s) {
   lb.begin(false, false);
   lb.addDescriptorSet(tex_b);
   lb.addDescriptorSet(samp_b);
+  lb.addPushConstant(0, 2, sizeof(Video::HdrParams), plume::RenderShaderStageFlag::PIXEL); // b0 space2
   lb.end();
   s.present_layout = lb.create(s.device.get());
   s.present_vs = s.device->createShader(g_present_vs_dxbc, sizeof(g_present_vs_dxbc), "main",
@@ -559,7 +578,7 @@ bool BuildPresentPipeline(VideoState &s) {
   pd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
   pd.cullMode = plume::RenderCullMode::NONE;
   pd.renderTargetCount = 1;
-  pd.renderTargetFormat[0] = plume::RenderFormat::B8G8R8A8_UNORM;
+  pd.renderTargetFormat[0] = Video::BackBufferFormat();
   pd.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
   s.present_pipeline = s.device->createGraphicsPipeline(pd);
   if (!s.present_pipeline ||
@@ -587,6 +606,51 @@ void WriteCrumb(FrameSlot &slot, uint32_t index, uint32_t value) {
       index == 0 ? D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN : D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
   list2->WriteBufferImmediate(1, &param, &mode);
   list2->Release();
+}
+
+// Whether Windows HDR is on for the monitor showing hwnd, and its peak.
+bool DisplayIsHdr(HWND hwnd, float *peak_nits) {
+  *peak_nits = 0.0f;
+  const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  IDXGIFactory1 *factory = nullptr;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    return false;
+  }
+  bool hdr = false;
+  IDXGIAdapter1 *adapter = nullptr;
+  for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+    IDXGIOutput *output = nullptr;
+    for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+      DXGI_OUTPUT_DESC desc = {};
+      IDXGIOutput6 *output6 = nullptr;
+      if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor &&
+          SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6)))) {
+        DXGI_OUTPUT_DESC1 desc1 = {};
+        if (SUCCEEDED(output6->GetDesc1(&desc1))) {
+          hdr = desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+          *peak_nits = desc1.MaxLuminance;
+        }
+        output6->Release();
+      }
+      output->Release();
+    }
+    adapter->Release();
+  }
+  factory->Release();
+  return hdr;
+}
+
+// scRGB (linear Rec.709, 1.0 = 80 nits) for the FP16 swapchain.
+void SetHdrColorSpace(VideoState &s) {
+  if (!s.hdr || !s.swap_chain) {
+    return;
+  }
+  IDXGISwapChain3 *sc = static_cast<plume::D3D12SwapChain *>(s.swap_chain.get())->d3d;
+  UINT support = 0;
+  if (sc && SUCCEEDED(sc->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
+      (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+    sc->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+  }
 }
 
 plume::RenderCommandList *OpenListLocked(VideoState &s) {
@@ -689,11 +753,20 @@ bool Video::CreateHostDevice(void *hwnd) {
     }
   }
 
+  // HDR displays: Windows shows an 8-bit swapchain at SDR brightness, flat
+  // next to the console on an HDR TV. An FP16 one in scRGB takes HDR.
+  {
+    const std::string mode = REXCVAR_GET(hdr_output);
+    const bool display_hdr = DisplayIsHdr(static_cast<HWND>(hwnd), &s.display_peak_nits);
+    s.hdr = mode == "on" || (mode == "auto" && display_hdr);
+    REXGPU_INFO("PGR4 D3D12: display HDR {} (peak {} nits), hdr_output {} -> {}", display_hdr ? "on" : "off",
+                s.display_peak_nits, mode, s.hdr ? "HDR (scRGB)" : "SDR");
+  }
   // kNumFrames + 1 images so acquiring the next never waits on scanout.
-  plume::RenderSwapChainDesc desc(static_cast<plume::RenderWindow>(hwnd),
-                                  plume::RenderFormat::B8G8R8A8_UNORM,
+  plume::RenderSwapChainDesc desc(static_cast<plume::RenderWindow>(hwnd), Video::BackBufferFormat(),
                                   kNumFrames + 1, false, kNumFrames);
   s.swap_chain = s.queue->createSwapChain(desc);
+  SetHdrColorSpace(s);
   if (!s.swap_chain || s.swap_chain->isEmpty()) {
     // Rendering (and frame dumps) still run; frames are submitted unpresented.
     REXGPU_ERROR("PGR4 D3D12: createSwapChain failed; rendering without presenting");
@@ -826,6 +899,28 @@ void Video::FreeTextureSlot(uint32_t slot) {
   if (slot < s.texture_slot_used.size()) {
     s.slots[s.frame].freed_texture_slots.push_back(slot);
   }
+}
+
+plume::RenderFormat Video::BackBufferFormat() {
+  return state().hdr ? plume::RenderFormat::R16G16B16A16_FLOAT : plume::RenderFormat::B8G8R8A8_UNORM;
+}
+
+Video::HdrParams Video::Hdr() {
+  const auto &s = state();
+  HdrParams p;
+  if (!s.hdr) {
+    return p;
+  }
+  // scRGB 1.0 is 80 nits.
+  const float paper = float(std::clamp(REXCVAR_GET(hdr_paper_white), 40.0, 1000.0));
+  float peak = float(REXCVAR_GET(hdr_peak));
+  if (peak <= 0.0f) {
+    peak = s.display_peak_nits > 0.0f ? std::min(s.display_peak_nits, 1000.0f) : 1000.0f;
+  }
+  peak = std::max(peak, paper);
+  p.paper_scale = paper / 80.0f;
+  p.highlight_gain = (peak / paper - 1.0f) * float(std::clamp(REXCVAR_GET(hdr_highlights), 0.0, 1.0));
+  return p;
 }
 
 double Video::DisplayAspect() {
@@ -1006,6 +1101,9 @@ void DrawPresentSource(VideoState &s, plume::RenderCommandList *list,
   list->setGraphicsPipelineLayout(s.present_layout.get());
   list->setGraphicsDescriptorSet(set.get(), 0);
   list->setGraphicsDescriptorSet(s.present_sampler_set.get(), 1);
+  Video::HdrParams hdr = Video::Hdr();
+  hdr.pad = REXCVAR_GET(fxaa) ? 1.0f : 0.0f;  // present_ps: gFxaa
+  list->setGraphicsPushConstants(0, &hdr, 0, sizeof(hdr));
   s.slots[s.frame].draws.push_back({}); // present
   list->drawInstanced(3, 1, 0, 0);
   s.slots[s.frame].parked.push_back(std::shared_ptr<void>(std::move(set)));
@@ -1036,7 +1134,9 @@ void Video::Present(const PresentSource &source) {
     SubmitWithoutPresent(s);
     WaitAllFrames(s);
     s.framebuffers.clear();
-    if (!s.swap_chain->resize() || !BuildSwapChainTargets(s)) {
+    const bool resized = s.swap_chain->resize();
+    SetHdrColorSpace(s);
+    if (!resized || !BuildSwapChainTargets(s)) {
       // Minimised windows report a 0x0 swapchain; retry next frame.
       if (s.swap_chain->getWidth() && s.swap_chain->getHeight()) {
         REXGPU_ERROR("PGR4 D3D12: swapchain resize failed");
@@ -1102,8 +1202,8 @@ void Video::Present(const PresentSource &source) {
   s.frame = (s.frame + 1) % kNumFrames;
 
   const uint64_t n = s.frames_presented.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n == 1 || n % 600 == 0) {
-    REXGPU_INFO("PGR4 D3D12: presented {} frames", n);
+  if (n == 1) {
+    REXGPU_INFO("PGR4 D3D12: presented the first frame");
   }
   if (n % 600 == 0) {
     // Per-frame averages over the last 600 frames. What is left of the frame
@@ -1115,6 +1215,7 @@ void Video::Present(const PresentSource &source) {
     const double gpu = s.gpu_wait_ns * 1e-6 * per;
     const double present = s.present_ns * 1e-6 * per;
     const double frame = wall * per;
+    if (REXCVAR_GET(gpu_verbose_log))
     REXGPU_INFO("PGR4 D3D12: {:.1f} fps, frame {:.1f} ms = renderer {:.1f} + gpu wait {:.1f} + present {:.1f} + "
                 "guest/other {:.1f}, {:.0f} draws/frame",
                 1000.0 / frame, frame, renderer, gpu, present, frame - renderer - gpu - present,

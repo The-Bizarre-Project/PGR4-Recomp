@@ -29,6 +29,15 @@ set(PGR4RECOMPILED_SOURCES
     src/audio_lock_trace.cpp
     src/occlusion_query.cpp
     src/walk_camera_pace.cpp
+    src/camera_height.cpp
+    src/four_players.cpp
+    src/pool_guard.cpp
+    src/frame_timer.cpp
+    src/fov.cpp
+    src/speedo.cpp
+    src/ui/pgr4_lua.cpp
+    src/ui/pgr4_settings.cpp
+    src/ui/pgr4_texts.cpp
     src/content/dlc.cpp
     src/profiler.cpp
 )
@@ -85,7 +94,7 @@ if(PGR4_D3D12_RENDERER)
         REQUIRED)
     set(PGR4_HOST_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/host_shaders")
     set(PGR4_HOST_SHADER_HEADERS)
-    foreach(shader IN ITEMS imgui_vs:vs_5_1 imgui_ps:ps_5_1 present_vs:vs_5_1 present_ps:ps_5_1
+    foreach(shader IN ITEMS imgui_vs:vs_5_1 imgui_ps:ps_5_1 present_vs:vs_5_1 present_ps:ps_5_1 depth_resolve_ps:ps_5_1 depth_copy_ps:ps_5_1
                         solid_ps:ps_5_1)
         string(REPLACE ":" ";" parts "${shader}")
         list(GET parts 0 stem)
@@ -207,3 +216,8 @@ if(WIN32)
     target_link_options(pgr4_launcher PRIVATE "LINKER:/MANIFEST:EMBED" "LINKER:/NODEFAULTLIB:libucrt.lib"
                         "LINKER:/MAP:pgr4_launcher.map")
 endif()
+
+# The port's own UI scripts (src/ui/scripts/, plain Lua), embedded by pgr4_lua.cpp with #embed:
+# a script's change rebuilds it.
+file(GLOB PGR4_UI_SCRIPTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/scripts/*.lua")
+set_source_files_properties(src/ui/pgr4_lua.cpp PROPERTIES OBJECT_DEPENDS "${PGR4_UI_SCRIPTS}")

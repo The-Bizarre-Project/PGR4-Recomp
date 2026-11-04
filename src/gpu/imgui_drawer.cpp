@@ -152,6 +152,7 @@ bool ImGuiOverlayDrawer::TryInitDeviceResources() {
   lb.addDescriptorSet(tex_b);  // t0, space0
   lb.addDescriptorSet(samp_b); // s0, space1
   lb.addPushConstant(0, 2, sizeof(float) * 4, plume::RenderShaderStageFlag::VERTEX); // Ortho b0,space2
+  lb.addPushConstant(1, 2, sizeof(Video::HdrParams), plume::RenderShaderStageFlag::PIXEL); // HDR b1,space2
   lb.end();
   layout_ = lb.create(device);
   if (!layout_) {
@@ -168,7 +169,7 @@ bool ImGuiOverlayDrawer::TryInitDeviceResources() {
   pd.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
   pd.cullMode = plume::RenderCullMode::NONE;
   pd.renderTargetCount = 1;
-  pd.renderTargetFormat[0] = plume::RenderFormat::B8G8R8A8_UNORM;
+  pd.renderTargetFormat[0] = Video::BackBufferFormat();
   pd.renderTargetBlend[0] = plume::RenderBlendDesc::AlphaBlend();
   pd.depthTargetFormat = plume::RenderFormat::UNKNOWN;
   // pos.f2@0, uv.f2@8, color RGBA8@16, stride 20.
@@ -258,6 +259,8 @@ void ImGuiOverlayDrawer::Begin(rex::ui::UIDrawContext &ctx, float coord_w, float
   ortho.translate[0] = -1.0f;
   ortho.translate[1] = 1.0f;
   cmd_->setGraphicsPushConstants(0, &ortho, 0, sizeof(ortho));
+  const Video::HdrParams hdr = Video::Hdr();
+  cmd_->setGraphicsPushConstants(1, &hdr, 0, sizeof(hdr));
 }
 
 void ImGuiOverlayDrawer::BeginDrawBatch(const rex::ui::ImmediateDrawBatch &b) {
